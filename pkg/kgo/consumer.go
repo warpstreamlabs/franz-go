@@ -423,10 +423,14 @@ func (cl *Client) PollFetches(ctx context.Context) Fetches {
 // this by using BlockRebalanceOnPoll, but this comes with different tradeoffs.
 // See the documentation on BlockRebalanceOnPoll for more information.
 func (cl *Client) PollRecords(ctx context.Context, maxPollRecords int) Fetches {
-	extraLogLinesVal := ctx.Value("extra_log_lines")
-	if extraLogLinesVal == nil {
-		extraLogLinesVal = struct{}{}
+	var extraLogLinesVal any = struct{}{}
+	if ctx != nil {
+		extraLogLinesVal = ctx.Value("extra_log_lines")
+		if extraLogLinesVal == nil {
+			extraLogLinesVal = struct{}{}
+		}
 	}
+
 	extraLogLines, ok := extraLogLinesVal.(map[string]time.Time)
 	if !ok {
 		extraLogLines = make(map[string]time.Time)
