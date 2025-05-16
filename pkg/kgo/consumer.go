@@ -431,13 +431,13 @@ func (cl *Client) PollRecords(ctx context.Context, maxPollRecords int) Fetches {
 		}
 	}
 
-	extraLogLines, ok := extraLogLinesVal.(map[string]time.Time)
+	extraLogLines, ok := extraLogLinesVal.(*sync.Map)
 	if !ok {
-		extraLogLines = make(map[string]time.Time)
+		extraLogLines = &sync.Map{}
 	}
-	extraLogLines["pollRecords_start"] = time.Now()
+	extraLogLines.Store("pollRecords_start", time.Now())
 	defer func() {
-		extraLogLines["pollRecords_end"] = time.Now()
+		extraLogLines.Store("pollRecords_end", time.Now())
 	}()
 
 	if maxPollRecords == 0 {
@@ -445,9 +445,9 @@ func (cl *Client) PollRecords(ctx context.Context, maxPollRecords int) Fetches {
 	}
 	c := &cl.consumer
 
-	extraLogLines["undirtyUncommitted_start"] = time.Now()
+	extraLogLines.Store("undirtyUncommitted_start", time.Now())
 	c.g.undirtyUncommitted()
-	extraLogLines["undirtyUncommitted_end"] = time.Now()
+	extraLogLines.Store("undirtyUncommitted_end", time.Now())
 
 	// If the user gave us a canceled context, we bail immediately after
 	// un-dirty-ing marked records.
@@ -455,7 +455,7 @@ func (cl *Client) PollRecords(ctx context.Context, maxPollRecords int) Fetches {
 		select {
 		case <-ctx.Done():
 			logKey := fmt.Sprintf("pollRecords_bail::%s", ctx.Err().Error())
-			extraLogLines[logKey] = time.Now()
+			extraLogLines.Store(logKey, time.Now())
 			return NewErrFetch(ctx.Err())
 		default:
 		}
@@ -465,9 +465,9 @@ func (cl *Client) PollRecords(ctx context.Context, maxPollRecords int) Fetches {
 	fill := func() {
 		logKey := fmt.Sprintf("fill::%d", time.Now().UnixNano())
 		if c.cl.cfg.blockRebalanceOnPoll {
-			extraLogLines[fmt.Sprintf("waitAndAddPoller_start::%s", logKey)] = time.Now()
+			extraLogLines.Store(fmt.Sprintf("waitAndAddPoller_start::%s", logKey), time.Now())
 			c.waitAndAddPoller()
-			extraLogLines[fmt.Sprintf("waitAndAddPoller_end::%s", logKey)] = time.Now()
+			extraLogLines.Store(fmt.Sprintf("waitAndAddPoller_end::%s", logKey), time.Now())
 			defer func() {
 				if len(fetches) == 0 {
 					c.unaddPoller()
@@ -475,9 +475,9 @@ func (cl *Client) PollRecords(ctx context.Context, maxPollRecords int) Fetches {
 			}()
 		}
 
-		extraLogLines[fmt.Sprintf("load_paused_start::%s", logKey)] = time.Now()
+		extraLogLines.Store(fmt.Sprintf("load_paused_start::%s", logKey), time.Now())
 		paused := c.loadPaused()
-		extraLogLines[fmt.Sprintf("load_paused_end::%s", logKey)] = time.Now()
+		extraLogLines.Store(fmt.Sprintf("load_paused_end::%s", logKey), time.Now())
 
 		// A group can grab the consumer lock then the group mu and
 		// assign partitions. The group mu is grabbed to update its
@@ -491,17 +491,17 @@ func (cl *Client) PollRecords(ctx context.Context, maxPollRecords int) Fetches {
 		// we could have grabbed some sources, then a group assigned,
 		// and after the assign, we update uncommitted with fetches
 		// from the old assignment
-		extraLogLines["cg_lock_acquire_start"] = time.Now()
+		extraLogLines.Store("cg_lock_acquire_start", time.Now())
 		c.mu.Lock()
-		extraLogLines["cg_lock_acquire_end"] = time.Now()
+		extraLogLines.Store("cg_lock_acquire_end", time.Now())
 		defer func() {
 			c.mu.Unlock()
-			extraLogLines["cg_lock_released"] = time.Now()
+			extraLogLines.Store("cg_lock_released", time.Now())
 		}()
 
-		extraLogLines["sources_ready_lock1_acquire_start"] = time.Now()
+		extraLogLines.Store("sources_ready_lock1_acquire_start", time.Now())
 		c.sourcesReadyMu.Lock()
-		extraLogLines["sources_ready_lock1_acquire_end"] = time.Now()
+		extraLogLines.Store("sources_ready_lock1_acquire_end", time.Now())
 		if maxPollRecords < 0 {
 			for _, ready := range c.sourcesReadyForDraining {
 				fetches = append(fetches, ready.takeBuffered(paused))
@@ -525,10 +525,10 @@ func (cl *Client) PollRecords(ctx context.Context, maxPollRecords int) Fetches {
 		c.fakeReadyForDraining = nil
 
 		c.sourcesReadyMu.Unlock()
-		extraLogLines["sources_ready1_lock_release"] = time.Now()
+		extraLogLines.Store("sources_ready1_lock_release", time.Now())
 
 		if len(realFetches) == 0 {
-			extraLogLines[fmt.Sprintf("real_fetches_empty::%s", logKey)] = time.Now()
+			extraLogLines.Store(fmt.Sprintf("real_fetches_empty::%s", logKey), time.Now())
 			return
 		}
 
@@ -542,32 +542,32 @@ func (cl *Client) PollRecords(ctx context.Context, maxPollRecords int) Fetches {
 		// have their uncommitted offset tracked, then we would allow
 		// duplicates.
 		if c.g != nil {
-			extraLogLines["update_uncommitted_start"] = time.Now()
+			extraLogLines.Store("update_uncommitted_start", time.Now())
 			c.g.updateUncommitted(realFetches)
-			extraLogLines["update_uncommitted_end"] = time.Now()
+			extraLogLines.Store("update_uncommitted_end", time.Now())
 		}
 	}
 
 	// We try filling fetches once before waiting. If we have no context,
 	// we guarantee that we just drain anything available and return.
-	extraLogLines["fill1_start"] = time.Now()
+	extraLogLines.Store("fill1_start", time.Now())
 	fill()
-	extraLogLines["fill1_end"] = time.Now()
+	extraLogLines.Store("fill1_end", time.Now())
 	if len(fetches) > 0 || ctx == nil {
-		extraLogLines["done_with_all_fetches"] = time.Now()
+		extraLogLines.Store("done_with_all_fetches", time.Now())
 		return fetches
 	}
 
 	done := make(chan struct{})
 	quit := false
 	go func() {
-		extraLogLines["fill_start"] = time.Now()
-		extraLogLines["sources_ready_lock2_acquire_start"] = time.Now()
+		extraLogLines.Store("fill_start", time.Now())
+		extraLogLines.Store("sources_ready_lock2_acquire_start", time.Now())
 		c.sourcesReadyMu.Lock()
-		extraLogLines["sources_ready_lock2_acquire_end"] = time.Now()
+		extraLogLines.Store("sources_ready_lock2_acquire_end", time.Now())
 		defer func() {
 			c.sourcesReadyMu.Unlock()
-			extraLogLines["sources_ready2_lock_release"] = time.Now()
+			extraLogLines.Store("sources_ready2_lock_release", time.Now())
 		}()
 
 		defer close(done)
@@ -575,37 +575,37 @@ func (cl *Client) PollRecords(ctx context.Context, maxPollRecords int) Fetches {
 		for !quit && len(c.sourcesReadyForDraining) == 0 && len(c.fakeReadyForDraining) == 0 {
 			c.sourcesReadyCond.Wait()
 		}
-		extraLogLines["done_waiting_for_sources_ready"] = time.Now()
+		extraLogLines.Store("done_waiting_for_sources_ready", time.Now())
 	}()
 
 	exit := func() {
-		extraLogLines["sources_ready_lock3_acquire_start"] = time.Now()
+		extraLogLines.Store("sources_ready_lock3_acquire_start", time.Now())
 		c.sourcesReadyMu.Lock()
-		extraLogLines["sources_ready_lock3_acquire_end"] = time.Now()
+		extraLogLines.Store("sources_ready_lock3_acquire_end", time.Now())
 		quit = true
 		c.sourcesReadyMu.Unlock()
-		extraLogLines["sources_ready3_lock_release"] = time.Now()
+		extraLogLines.Store("sources_ready3_lock_release", time.Now())
 		c.sourcesReadyCond.Broadcast()
-		extraLogLines["sources_ready_broadcast"] = time.Now()
+		extraLogLines.Store("sources_ready_broadcast", time.Now())
 	}
 
-	extraLogLines["exit_start"] = time.Now()
+	extraLogLines.Store("exit_start", time.Now())
 	select {
 	case <-cl.ctx.Done():
 		exit()
-		extraLogLines["exit_done_client_closed"] = time.Now()
+		extraLogLines.Store("exit_done_client_closed", time.Now())
 		return NewErrFetch(ErrClientClosed)
 	case <-ctx.Done():
 		exit()
-		extraLogLines[fmt.Sprintf("exit_done_ctx_done::%s", ctx.Err().Error())] = time.Now()
+		extraLogLines.Store(fmt.Sprintf("exit_done_ctx_done::%s", ctx.Err().Error()), time.Now())
 		return NewErrFetch(ctx.Err())
 	case <-done:
-		extraLogLines["exit_done_done_channel"] = time.Now()
+		extraLogLines.Store("exit_done_done_channel", time.Now())
 	}
 
-	extraLogLines["fill2_start"] = time.Now()
+	extraLogLines.Store("fill2_start", time.Now())
 	fill()
-	extraLogLines["fill2_end"] = time.Now()
+	extraLogLines.Store("fill2_end", time.Now())
 	return fetches
 }
 
