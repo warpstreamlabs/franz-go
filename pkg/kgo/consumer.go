@@ -572,8 +572,11 @@ func (cl *Client) PollRecords(ctx context.Context, maxPollRecords int) Fetches {
 
 		defer close(done)
 
+		idx := 0
 		for !quit && len(c.sourcesReadyForDraining) == 0 && len(c.fakeReadyForDraining) == 0 {
+			extraLogLines.Store(fmt.Sprintf("sources_ready_cond_wait::%d::%d::%d", idx, len(c.sourcesReadyForDraining), len(c.fakeReadyForDraining)), time.Now())
 			c.sourcesReadyCond.Wait()
+			idx++
 		}
 		extraLogLines.Store("done_waiting_for_sources_ready", time.Now())
 	}()
