@@ -208,8 +208,24 @@ func (c *Cluster) handleProduce(creq *clientReq) (kmsg.Response, error) {
 
 				if errCode == 0 {
 					switch {
+					// case window == nil && b.ProducerEpoch != -1:
+					// 	errCode = kerr.InvalidTxnState.Code
 					case window == nil && b.ProducerEpoch != -1:
-						errCode = kerr.InvalidTxnState.Code
+						// Kafka accepts produces from unknown producer IDs
+						// by implicitly creating producer state.
+						pidinf = &pidinfo{
+							pids:       &c.pids,
+							id:         b.ProducerID,
+							epoch:      b.ProducerEpoch,
+							lastActive: time.Now(),
+						}
+						c.pids.ids[b.ProducerID] = pidinf
+						window = pidinf.windows.mkpDefault(rt.Topic, rp.Partition)
+						var seqOk bool
+						seqOk, dup, baseOffset = window.pushAndValidate(b.ProducerEpoch, b.FirstSequence, b.NumRecords, pd.highWatermark)
+						if !seqOk {
+							errCode = kerr.OutOfOrderSequenceNumber.Code
+						}
 					case window != nil && b.ProducerEpoch < pidinf.epoch:
 						errCode = kerr.InvalidProducerEpoch.Code
 					case window != nil && b.ProducerEpoch > pidinf.epoch:
