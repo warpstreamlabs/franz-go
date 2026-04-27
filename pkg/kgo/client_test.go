@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -207,6 +208,24 @@ type someHook struct {
 	index int
 }
 
+type pollStartHook struct{}
+
+func (*pollStartHook) OnPollStart(_ context.Context) {}
+
+func TestHookPollStartRecognized(t *testing.T) {
+	h := &pollStartHook{}
+	if !implementsAnyHook(h) {
+		t.Fatal("HookPollStart implementor not recognized by implementsAnyHook")
+	}
+	hooks, err := processHooks([]Hook{h})
+	if err != nil {
+		t.Fatal("unexpected error from processHooks:", err)
+	}
+	if len(hooks) != 1 || hooks[0] != h {
+		t.Fatalf("expected hook to pass through processHooks unchanged, got %+v", hooks)
+	}
+}
+
 func (*someHook) OnNewClient(*Client) {
 	// ignore
 }
@@ -329,4 +348,70 @@ func TestSCRAMAuthBadCredentials(t *testing.T) {
 	}
 	// The error should indicate authentication failure
 	t.Logf("got expected error with bad credentials: %v", err)
+}
+
+func TestShareGroup(t *testing.T) {
+	t.Parallel()
+	adm() // ensure allowShare is initialized
+	if !allowShare {
+		t.Skip("broker does not support share groups (requires ShareFetch v2 and ShareAcknowledge v2, Kafka 4.2+)")
+	}
+
+	const totalRecords = 200
+
+	topic, topicCleanup := tmpTopicPartitions(t, 1)
+	defer topicCleanup()
+	group, groupCleanup := tmpShareGroup(t)
+	defer groupCleanup()
+
+	admin, _ := newTestClient(DefaultProduceTopic(topic), UnknownTopicRetries(-1))
+	defer admin.Close()
+	setShareAutoOffsetReset(t, admin, group)
+
+	for i := range totalRecords {
+		admin.Produce(context.Background(), StringRecord(strconv.Itoa(i)), func(_ *Record, err error) {
+			if err != nil {
+				t.Errorf("produce %d: %v", i, err)
+			}
+		})
+	}
+	if err := admin.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	cl, err := newTestClient(
+		ConsumeTopics(topic),
+		ShareGroup(group),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var consumed atomic.Int64
+	for {
+		fetches := cl.PollFetches(ctx)
+		for _, e := range fetches.Errors() {
+			if e.Err != nil {
+				t.Errorf("fetch error: %v", e)
+			}
+		}
+		n := int64(len(fetches.Records()))
+		if n > 0 {
+			consumed.Add(n)
+		}
+		if consumed.Load() >= totalRecords {
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+
+	if n := consumed.Load(); n != totalRecords {
+		t.Fatalf("expected %d records, got %d", totalRecords, n)
+	}
 }

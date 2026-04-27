@@ -4,13 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
-	"sync"
 	"time"
 
-	"github.com/twmb/franz-go/pkg/kmsg"
-
 	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kgo/internal/xsync"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 func ctx2fn(ctx context.Context) func() context.Context { return func() context.Context { return ctx } }
@@ -36,7 +34,7 @@ const (
 type GroupTransactSession struct {
 	cl *Client
 
-	failMu sync.Mutex
+	failMu xsync.Mutex
 
 	revoked   bool
 	revokedCh chan struct{} // closed once when revoked is set; reset after End
@@ -274,6 +272,17 @@ func (s *GroupTransactSession) End(ctx context.Context, commit TransactionEndTry
 			// ILLEGAL_GENERATION: rebalance began and completed
 			// before we committed.
 			//
+			// UNKNOWN_MEMBER_ID: coordinator forgot us (session
+			// timeout under load). Our consumer_group manage loop
+			// rejoins with a new member id; the txn just needs to
+			// abort here so the caller retries on a fresh session.
+			// Semantically equivalent to ILLEGAL_GENERATION.
+			//
+			// STALE_MEMBER_EPOCH: 848-side equivalent of
+			// ILLEGAL_GENERATION -- our epoch drifted (e.g. a
+			// heartbeat response was lost), the 848 manage loop
+			// rejoins, same recovery as above.
+			//
 			// REBALANCE_IN_PREGRESS: rebalance began, abort.
 			//
 			// COORDINATOR_NOT_AVAILABLE,
@@ -288,6 +297,8 @@ func (s *GroupTransactSession) End(ctx context.Context, commit TransactionEndTry
 			// certain versions.
 			switch {
 			case errors.Is(err, kerr.IllegalGeneration),
+				errors.Is(err, kerr.UnknownMemberID),
+				errors.Is(err, kerr.StaleMemberEpoch),
 				errors.Is(err, kerr.RebalanceInProgress),
 				errors.Is(err, kerr.CoordinatorNotAvailable),
 				errors.Is(err, kerr.CoordinatorLoadInProgress),
@@ -300,7 +311,7 @@ func (s *GroupTransactSession) End(ctx context.Context, commit TransactionEndTry
 			return false
 		}
 
-		var commitErrs []string
+		var commitErrs []error
 
 		committed := make(chan struct{})
 		g = s.cl.commitTransactionOffsets(ctx, postcommit,
@@ -311,7 +322,7 @@ func (s *GroupTransactSession) End(ctx context.Context, commit TransactionEndTry
 						hasAbortableCommitErr = true
 						return
 					}
-					commitErrs = append(commitErrs, err.Error())
+					commitErrs = append(commitErrs, err)
 					return
 				}
 				kip447 = resp.Version >= 3
@@ -322,7 +333,7 @@ func (s *GroupTransactSession) End(ctx context.Context, commit TransactionEndTry
 							if isAbortableCommitErr(err) {
 								hasAbortableCommitErr = true
 							} else {
-								commitErrs = append(commitErrs, fmt.Sprintf("topic %s partition %d: %v", t.Topic, p.Partition, err))
+								commitErrs = append(commitErrs, fmt.Errorf("topic %s partition %d: %w", t.Topic, p.Partition, err))
 							}
 						}
 					}
@@ -332,7 +343,11 @@ func (s *GroupTransactSession) End(ctx context.Context, commit TransactionEndTry
 		<-committed
 
 		if len(commitErrs) > 0 {
-			commitErr = fmt.Errorf("unable to commit transaction offsets: %s", strings.Join(commitErrs, ", "))
+			// Preserve the kerr chain via errors.Join so callers can
+			// use errors.Is(err, kerr.SomeError) to classify the
+			// failure. Without this, a raw string join would erase
+			// the wrapping and force callers to string-match.
+			commitErr = fmt.Errorf("unable to commit transaction offsets: %w", errors.Join(commitErrs...))
 		}
 	}
 
@@ -814,6 +829,21 @@ func (cl *Client) maybeRecoverProducerID(ctx context.Context) (necessary, did bo
 
 	var ke *kerr.Error
 	if ok := errors.As(err, &ke); !ok {
+		// The stored PID error is not a kerr (broker-side) error -- most
+		// likely a transient network error wrapped in errProducerIDLoadFail
+		// (dial refused, EOF, etc.) from a broker restart or transient
+		// unreachability. Rather than surfacing "producer ID has a fatal,
+		// unrecoverable error" to the caller, flag the PID for reload so
+		// the next produce/begin re-runs InitProducerID now that the
+		// broker is (probably) back.
+		if isRetryableBrokerErr(err) || isAnyDialErr(err) {
+			cl.producer.id.Store(&producerID{
+				id:    id,
+				epoch: epoch,
+				err:   errReloadProducerID,
+			})
+			return true, true, nil
+		}
 		return true, false, err
 	}
 

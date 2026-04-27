@@ -14,6 +14,7 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kbin"
 	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kgo/internal/xsync"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
@@ -35,7 +36,7 @@ type sink struct {
 	// but sequentially.
 	seqResps ring[*seqResp] // we never call die() on it
 
-	backoffMu   sync.Mutex // guards the following
+	backoffMu   xsync.Mutex // guards the following
 	needBackoff bool
 	backoffSeq  uint32 // prevents pile on failures
 
@@ -45,9 +46,9 @@ type sink struct {
 	// occurs, the backoff is not cleared.
 	consecutiveFailures atomic.Uint32
 
-	recBufsMu    sync.Mutex // guards the following
-	recBufs      []*recBuf  // contains all partition records for batch building
-	recBufsStart int        // incremented every req to avoid large batch starvation
+	recBufsMu    xsync.Mutex // guards the following
+	recBufs      []*recBuf   // contains all partition records for batch building
+	recBufsStart int         // incremented every req to avoid large batch starvation
 }
 
 type seqResp struct {
@@ -88,7 +89,6 @@ func (s *sink) createReq(id int64, epoch int16) (*produceRequest, *kmsg.AddParti
 		producerID:    id,
 		producerEpoch: epoch,
 
-		hasHook:    s.cl.producer.hasHookBatchWritten,
 		compressor: s.cl.cfg.compressor,
 
 		wireLength:      s.cl.baseProduceRequestLength(), // start length with no topics
@@ -124,7 +124,7 @@ func (s *sink) createReq(id int64, epoch int16) (*produceRequest, *kmsg.AddParti
 			continue
 		}
 
-		if s.cl.cfg.disableIdempotency {
+		if s.cl.cfg.disableIdempotency || s.cl.cfg.allowIdempotentProduceCancellation {
 			if cctx := batch.records[0].cancelingCtx(); cctx != nil && req.firstCancelingCtx == nil {
 				req.firstCancelingCtx = cctx //nolint:fatcontext // we are only here if firstCancelingCtx is currently nil
 			}
@@ -288,7 +288,7 @@ func (s *sink) anyCtx() context.Context {
 			// that's fine, this is just to cancel a request, we
 			// will handle retrying those batches when when
 			// handling the response.
-			if batch0.canFailFromLoadErrs && !batch0.unsureIfProduced && len(batch0.records) > 0 {
+			if batch0.canFailFromLoadErrs && (!batch0.unsureIfProduced || s.cl.cfg.allowIdempotentProduceCancellation) && len(batch0.records) > 0 {
 				r0 := batch0.records[0]
 				if rctx := r0.cancelingCtx(); rctx != nil {
 					batch0.mu.Unlock()
@@ -339,7 +339,7 @@ func (s *sink) produce(sem <-chan struct{}) bool {
 	// context.Canceled error is from *that* context rather than the client
 	// context or something else. So, we go through some special care to
 	// track setting the ctx / looking up if it is canceled.
-	var holCtxMu sync.Mutex
+	var holCtxMu xsync.Mutex
 	var holCtx context.Context
 	ctxFn := func() context.Context {
 		holCtxMu.Lock()
@@ -380,7 +380,7 @@ func (s *sink) produce(sem <-chan struct{}) bool {
 					if len(recBuf.batches) > 0 {
 						batch0 := recBuf.batches[0]
 						batch0.mu.Lock()
-						if batch0.canFailFromLoadErrs && !batch0.unsureIfProduced && len(batch0.records) > 0 {
+						if batch0.canFailFromLoadErrs && (!batch0.unsureIfProduced || s.cl.cfg.allowIdempotentProduceCancellation) && len(batch0.records) > 0 {
 							r0 := batch0.records[0]
 							if rctx := r0.cancelingCtx(); rctx != nil {
 								select {
@@ -751,6 +751,17 @@ func (s *sink) handleReqRespNoack(b *bytes.Buffer, debug bool, req *produceReque
 }
 
 func (s *sink) handleReqResp(br *broker, req *produceRequest, resp kmsg.Response, err error) {
+	// Bump retry counter for every batch in this request. Runs once per
+	// br.do completion, not per AppendTo call, so the broker-level
+	// zero-bytes-written retry at broker.go does not double-count.
+	for _, partitions := range req.batches.bs {
+		for _, batch := range partitions {
+			batch.mu.Lock()
+			batch.tries++
+			batch.mu.Unlock()
+		}
+	}
+
 	if err != nil {
 		s.handleReqClientErr(req, err)
 		return
@@ -825,6 +836,7 @@ func (s *sink) handleReqResp(br *broker, req *produceRequest, resp kmsg.Response
 				batch,
 				req.producerID,
 				req.producerEpoch,
+				tmetrics[partition],
 			)
 			if retry {
 				reqRetry.addSeqBatch(topic, tid, partition, batch)
@@ -864,6 +876,7 @@ func (s *sink) handleReqRespBatch(
 	batch seqRecBatch,
 	producerID int64,
 	producerEpoch int16,
+	batchMetrics ProduceBatchMetrics,
 ) (retry, didProduce bool) {
 	batch.owner.mu.Lock()
 	defer batch.owner.mu.Unlock()
@@ -930,6 +943,9 @@ func (s *sink) handleReqRespBatch(
 	}
 
 	err := kerr.ErrorForCode(rp.ErrorCode)
+	if errors.Is(err, kerr.MessageTooLarge) {
+		err = fmt.Errorf("%w (uncompressed_bytes=%d, compressed_bytes=%d)", err, batchMetrics.UncompressedBytes, batchMetrics.CompressedBytes)
+	}
 	failUnknown := batch.owner.checkUnknownFailLimit(err)
 	switch {
 	case err == kerr.ConcurrentTransactions:
@@ -1208,7 +1224,7 @@ func (s *sink) handleRetryBatches(
 			return
 		}
 
-		if (canFail && !batch.unsureIfProduced) || s.cl.cfg.disableIdempotency {
+		if (canFail && !batch.unsureIfProduced) || s.cl.cfg.disableIdempotency || s.cl.cfg.allowIdempotentProduceCancellation {
 			if err := batch.maybeFailErr(&s.cl.cfg); err != nil {
 				batch.owner.failAllRecords(err)
 				return
@@ -1329,7 +1345,7 @@ type recBuf struct {
 	// of records buffered in total on this recBuf.
 	buffered atomic.Int64
 
-	mu sync.Mutex // guards r/w access to all fields below
+	mu xsync.Mutex // guards r/w access to all fields below
 
 	// sink is who is currently draining us. This can be modified
 	// concurrently during a metadata update.
@@ -1479,7 +1495,9 @@ func (recBuf *recBuf) bufferRecord(pr promisedRec, abortOnNewBatch bool) bool {
 		case appended: // we return true below
 		default: // processed as failure
 			recBuf.cl.prsPool.put(newBatch.records)
-			recBuf.cl.producer.promiseRecord(pr, kerr.MessageTooLarge)
+			recBuf.cl.producer.promiseRecord(pr,
+				fmt.Errorf("%w (uncompressed_bytes=%d)", kerr.MessageTooLarge, pr.userSize()),
+			)
 			return true
 		}
 
@@ -1567,11 +1585,11 @@ func (recBuf *recBuf) bumpRepeatedLoadErr(err error) {
 	batch0.mu.Lock()
 	batch0.tries++
 	var (
-		canFail        = !recBuf.cl.idempotent() || (batch0.canFailFromLoadErrs && !batch0.unsureIfProduced) // we can only fail if we are not idempotent or if we have no outstanding requests
-		batch0Fail     = batch0.maybeFailErr(&recBuf.cl.cfg) != nil                                          // timeout, retries, or aborting
-		netErr         = isRetryableBrokerErr(err) || isDialNonTimeoutErr(err)                               // we can fail if this is *not* a network error
-		retryableKerr  = kerr.IsRetriable(err)                                                               // we fail if this is not a retryable kerr,
-		isUnknownLimit = recBuf.checkUnknownFailLimit(err)                                                   // or if it is, but it is UnknownTopicOrPartition and we are at our limit
+		canFail        = !recBuf.cl.idempotent() || recBuf.cl.cfg.allowIdempotentProduceCancellation || (batch0.canFailFromLoadErrs && !batch0.unsureIfProduced) // we can only fail if we are not idempotent, cancellation is allowed, or if we have no outstanding requests
+		batch0Fail     = batch0.maybeFailErr(&recBuf.cl.cfg) != nil                                                                                              // timeout, retries, or aborting
+		netErr         = isRetryableBrokerErr(err) || isDialNonTimeoutErr(err)                                                                                   // we can fail if this is *not* a network error
+		retryableKerr  = kerr.IsRetriable(err)                                                                                                                   // we fail if this is not a retryable kerr,
+		isUnknownLimit = recBuf.checkUnknownFailLimit(err)                                                                                                       // or if it is, but it is UnknownTopicOrPartition and we are at our limit
 
 		willFail = canFail && (batch0Fail || !netErr && (!retryableKerr || retryableKerr && isUnknownLimit))
 	)
@@ -1719,7 +1737,7 @@ type recBatch struct {
 	firstTimestamp    int64 // since unix epoch, in millis
 	maxTimestampDelta int64
 
-	mu      sync.Mutex    // guards appendTo's reading of records against failAllRecords emptying it
+	mu      xsync.Mutex   // guards appendTo's reading of records against failAllRecords emptying it
 	records []promisedRec // record w/ length, ts calculated
 }
 
@@ -1874,7 +1892,6 @@ type produceRequest struct {
 	//
 	// We use this in handleReqResp for the OnProduceHook.
 	metrics produceMetrics
-	hasHook bool
 
 	compressor Compressor
 
@@ -1946,7 +1963,7 @@ func (p *produceRequest) tryAddBatch(produceVersion int32, recBuf *recBuf, batch
 	}
 
 	if recBuf.batches[0] == batch {
-		if !p.idempotent() || (batch.canFailFromLoadErrs && !batch.unsureIfProduced) {
+		if !p.idempotent() || recBuf.cl.cfg.allowIdempotentProduceCancellation || (batch.canFailFromLoadErrs && !batch.unsureIfProduced) {
 			if err := batch.maybeFailErr(&batch.owner.cl.cfg); err != nil {
 				recBuf.failAllRecords(err)
 				return false
@@ -2122,7 +2139,7 @@ func (cl *Client) maxRecordBatchBytesForTopic(topic string) int32 {
 	wireLengthLimit := cl.cfg.maxBrokerWriteBytes
 
 	recordBatchLimit := wireLengthLimit - minOnePartitionBatchLength
-	if cfgLimit := cl.cfg.maxRecordBatchBytes; cfgLimit < recordBatchLimit {
+	if cfgLimit := cl.cfg.maxRecordBatchBytes(topic); cfgLimit < recordBatchLimit {
 		recordBatchLimit = cfgLimit
 	}
 	return recordBatchLimit
@@ -2263,9 +2280,7 @@ func (p *produceRequest) IsFlexible() bool   { return p.version >= 9 }
 func (p *produceRequest) AppendTo(dst []byte) []byte {
 	flexible := p.IsFlexible()
 
-	if p.hasHook {
-		p.metrics = make(map[string]map[int32]ProduceBatchMetrics)
-	}
+	p.metrics = make(map[string]map[int32]ProduceBatchMetrics)
 
 	if p.version >= 3 {
 		if flexible {
@@ -2296,11 +2311,8 @@ func (p *produceRequest) AppendTo(dst []byte) []byte {
 			dst = kbin.AppendArrayLen(dst, len(partitions))
 		}
 
-		var tmetrics map[int32]ProduceBatchMetrics
-		if p.hasHook {
-			tmetrics = make(map[int32]ProduceBatchMetrics)
-			p.metrics[topic] = tmetrics
-		}
+		tmetrics := make(map[int32]ProduceBatchMetrics)
+		p.metrics[topic] = tmetrics
 
 		for partition, batch := range partitions {
 			dst = kbin.AppendInt32(dst, partition)
@@ -2314,8 +2326,16 @@ func (p *produceRequest) AppendTo(dst []byte) []byte {
 				batch.mu.Unlock()
 				continue
 			}
+			// canFailFromLoadErrs is a monotonic one-way mutation
+			// (true -> false, never the other way). It is safe inside
+			// AppendTo even under the broker-level zero-bytes-written
+			// retry path at broker.go, because the retry re-invokes
+			// AppendTo on the same request; the second call sets the
+			// same value with no behavior change. Any mutation in
+			// AppendTo that affects the serialized bytes must satisfy
+			// the same monotonicity criterion, or it must move out of
+			// AppendTo (see tries, moved to handleReqResp).
 			batch.canFailFromLoadErrs = false // we are going to write this batch: the response status is now unknown
-			batch.tries++
 			var pmetrics ProduceBatchMetrics
 			if p.version < 3 {
 				dst, pmetrics = batch.appendToAsMessageSet(dst, uint8(p.version), p.compressor)
@@ -2323,9 +2343,7 @@ func (p *produceRequest) AppendTo(dst []byte) []byte {
 				dst, pmetrics = batch.appendTo(dst, p.version, p.producerID, p.producerEpoch, p.txnID != nil, p.compressor)
 			}
 			batch.mu.Unlock()
-			if p.hasHook {
-				tmetrics[partition] = pmetrics
-			}
+			tmetrics[partition] = pmetrics
 			if flexible {
 				dst = append(dst, 0)
 			}

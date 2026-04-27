@@ -402,27 +402,31 @@ func TestPauseIssue489(t *testing.T) {
 		{"records", func(ctx context.Context) Fetches { return cl.PollRecords(ctx, 1000) }},
 	} {
 		for range 10 {
-			ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			// Phase 1 and phase 2 each get their own budget so phase 1
+			// cannot starve phase 2 under parallel-test contention.
+			phase1Ctx, phase1Cancel := context.WithTimeout(ctx, 10*time.Second)
 			var sawZero, sawOne, sawTwo bool
-			for (!sawZero || !sawOne || !sawTwo) && !closed(ctx.Done()) {
-				fs := pollfn.fn(ctx)
+			for (!sawZero || !sawOne || !sawTwo) && !closed(phase1Ctx.Done()) {
+				fs := pollfn.fn(phase1Ctx)
 				fs.EachRecord(func(r *Record) {
 					sawZero = sawZero || r.Partition == 0
 					sawOne = sawOne || r.Partition == 1
 					sawTwo = sawTwo || r.Partition == 2
 				})
 			}
+			phase1Cancel()
 			cl.PauseFetchPartitions(map[string][]int32{t1: {0}})
 			sawZero, sawOne, sawTwo = false, false, false
-			for i := 0; i < 10 && !closed(ctx.Done()); i++ {
-				fs := pollfn.fn(ctx)
+			phase2Ctx, phase2Cancel := context.WithTimeout(ctx, 10*time.Second)
+			for (!sawOne || !sawTwo) && !closed(phase2Ctx.Done()) {
+				fs := pollfn.fn(phase2Ctx)
 				fs.EachRecord(func(r *Record) {
 					sawZero = sawZero || r.Partition == 0
 					sawOne = sawOne || r.Partition == 1
 					sawTwo = sawTwo || r.Partition == 2
 				})
 			}
-			cancel()
+			phase2Cancel()
 			if sawZero {
 				t.Fatalf("%s: saw partition zero even though it was paused", pollfn.name)
 			}
@@ -908,6 +912,70 @@ func TestGroupSimple(t *testing.T) {
 				if err := cl.CommitUncommittedOffsets(context.Background()); err != nil {
 					t.Errorf("unexpected err: %v", err)
 				}
+			}
+		})
+	}
+}
+
+type pollStartCountHook struct {
+	n atomic.Int64
+}
+
+func (h *pollStartCountHook) OnPollStart(_ context.Context) { h.n.Add(1) }
+
+func TestHookPollStart(t *testing.T) {
+	t.Parallel()
+
+	const nRecords = 5
+
+	for _, tc := range []struct {
+		name string
+		poll func(*Client, context.Context) Fetches
+	}{
+		{"PollRecords", func(cl *Client, ctx context.Context) Fetches { return cl.PollRecords(ctx, nRecords) }},
+		{"PollFetches", func(cl *Client, ctx context.Context) Fetches { return cl.PollFetches(ctx) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			topic, cleanup := tmpTopicPartitions(t, 1)
+			defer cleanup()
+
+			hook := &pollStartCountHook{}
+			cl, _ := newTestClient(
+				DefaultProduceTopic(topic),
+				UnknownTopicRetries(-1),
+				ConsumePartitions(map[string]map[int32]Offset{
+					topic: {0: NewOffset().At(0)},
+				}),
+				WithHooks(hook),
+			)
+			defer cl.Close()
+
+			recs := make([]*Record, nRecords)
+			for i := range recs {
+				recs[i] = StringRecord(strconv.Itoa(i))
+			}
+			if err := cl.ProduceSync(context.Background(), recs...).FirstErr(); err != nil {
+				t.Fatal(err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+
+			var pollCalls int64
+			var got int
+			for got < nRecords {
+				if ctx.Err() != nil {
+					t.Fatal("timed out waiting for records")
+				}
+				pollCalls++
+				fs := tc.poll(cl, ctx)
+				got += len(fs.Records())
+			}
+
+			if n := hook.n.Load(); n != pollCalls {
+				t.Fatalf("expected OnPollStart called %d times (one per poll call), got %d", pollCalls, n)
 			}
 		})
 	}

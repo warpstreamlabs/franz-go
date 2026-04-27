@@ -20,6 +20,7 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kbin"
 	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kgo/internal/xsync"
 	"github.com/twmb/franz-go/pkg/kmsg"
 	"github.com/twmb/franz-go/pkg/sasl"
 )
@@ -157,7 +158,7 @@ type broker struct {
 	cxnGroup   *brokerCxn
 	cxnSlow    *brokerCxn
 
-	reapMu sync.Mutex // held when modifying a brokerCxn
+	reapMu xsync.Mutex // held when modifying a brokerCxn
 
 	// reqs manages incoming message requests.
 	reqs ring[promisedReq]
@@ -479,9 +480,17 @@ start:
 	corrID, bytesWritten, writeWait, timeToWrite, readEnqueue, writeErr := cxn.writeRequest(pr.ctx, pr.enqueue, req)
 
 	if writeErr != nil {
-		pr.promise(nil, writeErr)
 		cxn.die()
 		cxn.hookWriteE2E(req.Key(), bytesWritten, writeWait, timeToWrite, writeErr)
+		// If we wrote 0 bytes, the broker never saw the request.
+		// Safe to retry once on a new connection, same as the
+		// loadConnection retry above. Does not count against the
+		// client's retry budget.
+		if bytesWritten == 0 && !retriedOnNewConnection {
+			retriedOnNewConnection = true
+			goto start
+		}
+		pr.promise(nil, writeErr)
 		return
 	}
 
@@ -547,7 +556,7 @@ func (b *broker) loadConnection(ctx context.Context, req kmsg.Request) (*brokerC
 	case reqKey == 0:
 		pcxn = &b.cxnProduce
 		isProduceCxn = true
-	case reqKey == 1:
+	case reqKey == 1 || reqKey == 78: // Fetch or ShareFetch (both long-poll)
 		pcxn = &b.cxnFetch
 		isFetchCxn = true
 	case reqKey == 11 || reqKey == 14: // join || sync
@@ -714,7 +723,7 @@ func (b *broker) connect(ctx context.Context) (net.Conn, error) {
 		if !errors.Is(err, ErrClientClosed) && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "operation was canceled") {
 			if errors.Is(err, io.EOF) {
 				b.cl.cfg.logger.Log(LogLevelWarn, "unable to open connection to broker due to an immediate EOF, which often means the client is using TLS when the broker is not expecting it (is TLS misconfigured?)", "addr", b.addr, "broker", logID(b.meta.NodeID), "err", err)
-				return nil, &ErrFirstReadEOF{kind: firstReadDial, err: err}
+				return nil, &ErrFirstReadEOF{kind: firstReadDial, err: err, retry: b.cl.cfg.alwaysRetryEOF}
 			}
 			b.cl.cfg.logger.Log(LogLevelWarn, "unable to open connection to broker", "addr", b.addr, "broker", logID(b.meta.NodeID), "err", err)
 		}
@@ -762,20 +771,25 @@ type brokerCxn struct {
 }
 
 func (cxn *brokerCxn) init(isProduceCxn bool, tries int) error {
-	hasVersions := cxn.b.loadVersions() != nil
-	if !hasVersions {
-		if cxn.b.cl.cfg.maxVersions == nil || cxn.b.cl.cfg.maxVersions.HasKey(18) {
-			if err := cxn.requestAPIVersions(tries); err != nil {
-				if !errors.Is(err, ErrClientClosed) && !isRetryableBrokerErr(err) {
-					cxn.cl.cfg.logger.Log(LogLevelError, "unable to request api versions", "broker", logID(cxn.b.meta.NodeID), "err", err)
-				}
-				return err
+	// We always send ApiVersions on every new connection, even if we have
+	// already cached the broker's versions from a previous connection.
+	// ApiVersions is how we advertise our ClientSoftwareName/Version to the
+	// broker for the lifetime of this connection (KIP-714 client metrics
+	// match on these). If we skip it on a reused-broker connection, that
+	// connection registers as "unknown" software on the broker side, and
+	// any broker-side metric subscriptions scoped to our software name
+	// silently miss it. See twmb/franz-go#1296.
+	if cxn.b.cl.cfg.maxVersions == nil || cxn.b.cl.cfg.maxVersions.HasKey(18) {
+		if err := cxn.requestAPIVersions(tries); err != nil {
+			if !errors.Is(err, ErrClientClosed) && !isRetryableBrokerErr(err) {
+				cxn.cl.cfg.logger.Log(LogLevelError, "unable to request api versions", "broker", logID(cxn.b.meta.NodeID), "err", err)
 			}
-		} else {
-			// We have a max versions, and it indicates no support
-			// for ApiVersions. We just store a default empty map.
-			cxn.b.storeVersions(newBrokerVersions(0))
+			return err
 		}
+	} else if cxn.b.loadVersions() == nil {
+		// We have a max versions, and it indicates no support for
+		// ApiVersions. We just store a default empty map (once).
+		cxn.b.storeVersions(newBrokerVersions(0))
 	}
 
 	if err := cxn.sasl(); err != nil {
@@ -827,7 +841,7 @@ start:
 			return &errApiVersionsReset{err}
 		} else if errors.Is(err, io.EOF) {
 			cxn.b.cl.cfg.logger.Log(LogLevelWarn, "read from broker received EOF during api versions discovery, which often happens when the broker requires TLS and the client is not using it (is TLS misconfigured?)", "addr", cxn.b.addr, "broker", logID(cxn.b.meta.NodeID), "err", err)
-			err = &ErrFirstReadEOF{kind: firstReadTLS, err: err}
+			err = &ErrFirstReadEOF{kind: firstReadTLS, err: err, retry: cxn.b.cl.cfg.alwaysRetryEOF}
 		}
 		return err
 	}
@@ -1452,7 +1466,7 @@ func (cxn *brokerCxn) discard() {
 			err        error
 			timeToRead time.Duration
 
-			deadlineMu  sync.Mutex
+			deadlineMu  xsync.Mutex
 			deadlineSet bool
 
 			readDone = make(chan struct{})
@@ -1578,7 +1592,7 @@ func (cxn *brokerCxn) handleResp(pr promisedResp) {
 			} else {
 				cxn.b.cl.cfg.logger.Log(LogLevelWarn, "read from broker errored, killing connection after 0 successful responses (is SASL missing?)", "req", kmsg.Key(pr.resp.Key()).Name(), "addr", cxn.b.addr, "broker", logID(cxn.b.meta.NodeID), "err", err)
 				if err == io.EOF { // specifically avoid checking errors.Is to ensure this is not already wrapped
-					err = &ErrFirstReadEOF{kind: firstReadSASL, err: err}
+					err = &ErrFirstReadEOF{kind: firstReadSASL, err: err, retry: cxn.b.cl.cfg.alwaysRetryEOF}
 				}
 			}
 		} else {

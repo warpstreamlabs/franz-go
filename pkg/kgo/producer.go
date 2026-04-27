@@ -10,13 +10,14 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kgo/internal/xsync"
 	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 type producer struct {
 	// mu and c are used for flush and drain notifications; mu is used for
 	// a few other tight locks.
-	mu sync.Mutex
+	mu xsync.Mutex
 	c  *sync.Cond
 
 	bufferedRecords int64
@@ -24,7 +25,7 @@ type producer struct {
 
 	cl *Client
 
-	topicsMu sync.Mutex // locked to prevent concurrent updates; reads are always atomic
+	topicsMu xsync.Mutex // locked to prevent concurrent updates; reads are always atomic
 	topics   *topicsPartitions
 
 	// Hooks exist behind a pointer because likely they are not used.
@@ -35,12 +36,10 @@ type producer struct {
 		unbuffered  []HookProduceRecordUnbuffered
 	}
 
-	hasHookBatchWritten bool
-
 	// unknownTopics buffers all records for topics that are not loaded.
 	// The map is to a pointer to a slice for reasons documented in
 	// waitUnknownTopic.
-	unknownTopicsMu sync.Mutex
+	unknownTopicsMu xsync.Mutex
 	unknownTopics   map[string]*unknownTopicProduces
 
 	id           atomic.Value
@@ -55,12 +54,12 @@ type producer struct {
 
 	aborting atomic.Int32 // >0 if aborting, can abort many times concurrently
 
-	idMu      sync.Mutex
+	idMu      xsync.Mutex
 	idVersion int16
 
 	batchPromises ring[batchPromise] // we never call die() on it
 
-	txnMu   sync.Mutex
+	txnMu   xsync.Mutex
 	inTxn   bool
 	tx890p2 bool
 }
@@ -102,7 +101,7 @@ func (cl *Client) EnsureProduceConnectionIsOpen(ctx context.Context, brokers ...
 		keep = brokers[:0]
 		all  bool
 		wg   sync.WaitGroup
-		mu   sync.Mutex
+		mu   xsync.Mutex
 		errs []error
 	)
 	for _, b := range brokers {
@@ -180,6 +179,7 @@ func (p *producer) init(cl *Client) {
 		err:   errReloadProducerID,
 	})
 	p.c = sync.NewCond(&p.mu)
+	p.batchPromises.initMaxLen(max(int(cl.cfg.maxBufferedRecords), 8192))
 
 	inithooks := func() {
 		if p.hooks == nil {
@@ -203,9 +203,6 @@ func (p *producer) init(cl *Client) {
 		if h, ok := h.(HookProduceRecordUnbuffered); ok {
 			inithooks()
 			p.hooks.unbuffered = append(p.hooks.unbuffered, h)
-		}
-		if _, ok := h.(HookProduceBatchWritten); ok {
-			p.hasHookBatchWritten = true
 		}
 	})
 }
@@ -493,8 +490,9 @@ func (cl *Client) TryProduce(
 // If the client is configured to automatically flush the client currently has
 // the configured maximum amount of records buffered, Produce will block. The
 // context can be used to cancel waiting while records flush to make space. In
-// contrast, if flushing is configured, the record will be failed immediately
-// with ErrMaxBuffered (this same behavior can be had with TryProduce).
+// contrast, if manual flushing is configured, the record will be failed
+// immediately with ErrMaxBuffered (this same behavior can be had with
+// TryProduce).
 //
 // Once a record is buffered into a batch, it can be canceled in three ways:
 // canceling the context, the record timing out, or hitting the maximum
@@ -556,7 +554,10 @@ func (cl *Client) produce(
 
 	userSize := r.userSize()
 	if cl.cfg.maxBufferedBytes > 0 && userSize > cl.cfg.maxBufferedBytes {
-		p.promiseRecordBeforeBuf(promisedRec{ctx, promise, r}, kerr.MessageTooLarge)
+		p.promiseRecordBeforeBuf(
+			promisedRec{ctx, promise, r},
+			fmt.Errorf("%w (uncompressed_bytes=%d)", kerr.MessageTooLarge, userSize),
+		)
 		return
 	}
 
@@ -1121,6 +1122,7 @@ func (cl *Client) waitUnknownTopic(
 		tries        int
 		unknownTries int64
 		err          error
+		lastRetryErr error
 		after        <-chan time.Time
 	)
 
@@ -1146,7 +1148,11 @@ func (cl *Client) waitUnknownTopic(
 		case <-cl.ctx.Done():
 			err = ErrClientClosed
 		case <-after:
-			err = ErrRecordTimeout
+			if lastRetryErr != nil {
+				err = fmt.Errorf("%w, last err: %w", ErrRecordTimeout, lastRetryErr)
+			} else {
+				err = ErrRecordTimeout
+			}
 		case err = <-unknown.fatal:
 		case retryableErr, ok := <-unknown.wait:
 			if !ok {
@@ -1154,6 +1160,7 @@ func (cl *Client) waitUnknownTopic(
 				return // metadata was successful!
 			}
 			cl.cfg.logger.Log(LogLevelInfo, "new topic metadata wait failed, retrying wait", "topic", topic, "err", retryableErr)
+			lastRetryErr = retryableErr
 			tries++
 			if int64(tries) > cl.cfg.recordRetries {
 				err = fmt.Errorf("no partitions available after attempting to refresh metadata %d times, last err: %w", tries, retryableErr)
